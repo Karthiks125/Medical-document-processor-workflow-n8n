@@ -1,0 +1,324 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Medical Document Upload",
+        "formDescription": "Upload medical documents for automated triage and routing",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Upload Document",
+              "fieldType": "file",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Document Type",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Referral"
+                  },
+                  {
+                    "option": "Rx Request"
+                  },
+                  {
+                    "option": "Reports"
+                  },
+                  {
+                    "option": "Billing/Admin"
+                  },
+                  {
+                    "option": "Surgery"
+                  },
+                  {
+                    "option": "Other"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Primary Email",
+              "fieldType": "email"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "d00ede97-6df2-477e-a7fb-aeeff52a6f67",
+      "name": "On form submission",
+      "webhookId": "_INSERT_YOUR_WEBHOOK_ID"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get file data from form\nconst fileData = $input.item.json;\nconst apiKey = '_INSERT_YOUR_GOOGLE_GEMINI_API_KEY';\n\n// Check if we have file data\nif (!fileData['Upload Document'] || !fileData['Upload Document'][0]) {\n  throw new Error('No file uploaded');\n}\n\nconst uploadedFile = fileData['Upload Document'][0];\nconst fileName = uploadedFile.filename;\nlet mimeType = uploadedFile.mimeType || uploadedFile.mimetype;\n\n// If mimeType is still empty, detect from filename\nif (!mimeType) {\n  if (fileName.toLowerCase().endsWith('.pdf')) {\n    mimeType = 'application/pdf';\n  } else if (fileName.toLowerCase().match(/\\.(jpg|jpeg)$/)) {\n    mimeType = 'image/jpeg';\n  } else if (fileName.toLowerCase().endsWith('.png')) {\n    mimeType = 'image/png';\n  } else if (fileName.toLowerCase().match(/\\.(tif|tiff)$/)) {\n    mimeType = 'image/tiff';\n  } else {\n    mimeType = 'application/pdf';\n  }\n}\n\n// Get binary data from the input item\nconst binaryData = $input.item.binary;\n\n// The binary data is typically stored with a key\nconst binaryKey = Object.keys(binaryData || {})[0];\nif (!binaryKey || !binaryData[binaryKey]) {\n  throw new Error('No binary data found');\n}\n\n// Get base64 from binary data\nlet base64Data = binaryData[binaryKey].data;\n\n// Remove data URL prefix if present\nif (typeof base64Data === 'string' && base64Data.startsWith('data:')) {\n  base64Data = base64Data.split(',')[1];\n}\n\n// Build Gemini API request for text extraction\nconst extractionPrompt = \"Extract all text from this document. Return ONLY the extracted text with no additional commentary, formatting, or explanation. Preserve line breaks and structure where possible.\";\n\nconst requestBody = {\n  contents: [\n    {\n      parts: [\n        {\n          inline_data: {\n            mime_type: mimeType,\n            data: base64Data\n          }\n        },\n        {\n          text: extractionPrompt\n        }\n      ]\n    }\n  ],\n  generationConfig: {\n    temperature: 0.1\n  }\n};\n\n// Use gemini-2.5-flash with v1beta endpoint\nconst response = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey,\n  headers: {\n    'Content-Type': 'application/json'\n  },\n  body: requestBody,\n  json: true\n});\n\n// Add error handling\nif (!response.candidates || !response.candidates[0] || !response.candidates[0].content) {\n  throw new Error('Invalid response from Gemini API');\n}\n\n// Extract the text from response\nconst extractedText = response.candidates[0].content.parts[0].text;\n\n// CRITICAL: Preserve stored_binary from the input\nconsole.log('Input has stored_binary:', !!fileData.stored_binary);\n\n// Return the data with extracted text AND pass through stored_binary\nreturn {\n  json: {\n    document_text: extractedText,\n    selected_document_type: fileData['Document Type'] || 'Unknown',\n    file_name: fileName,\n    fax_metadata: fileData['Additional Notes'] || '',\n    default_routing_email_address: fileData['Primary Email ID'] || '',\n    file_mime_type: mimeType,\n    file_number: fileData.file_number,\n    total_files: fileData.total_files,\n    batch_id: fileData.batch_id,\n    // Pass through the stored_binary from Split Files\n    stored_binary: fileData.stored_binary\n  },\n  binary: binaryData\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        384,
+        -208
+      ],
+      "id": "dc272470-f993-46ab-bb56-7090826d8f51",
+      "name": "Interpret the file"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get the data from previous node\nconst data = $input.item.json;\n\nconsole.log('Input has stored_binary:', !!data.stored_binary);\n\n// Build the prompt text\nconst promptText = `RETURN ONLY RAW JSON WITH NO MARKDOWN NO BACKTICKS NO CODE FENCES. CRITICAL: Never invent or generate patient information. Only extract what is explicitly written in the document text. If information is missing, use Unknown or null.\n\nYou are a medical document triage assistant for an ophthalmology clinic. Analyze the document text provided and return a valid JSON object with these exact fields:\n\n- document_category (one of: referral_new_patient, referral_existing_patient, imaging_request_or_report, surgical_booking_or_related, billing_or_admin_only, records_request, other_or_unclear)\n- routing_email_address (correct clinic email based on category, use default_routing_email_address from input if unclear)\n- suggested_email_subject (short subject line; SUBJECT RULES: if category is referral start with 'Referral:', if imaging start with 'Imaging:', if surgical start with 'Surgical booking:', if billing/admin start with 'Billing:' or 'Admin:', if records start with 'Records request:', otherwise 'Document:'; always include patient name after prefix when available)\n- suggested_email_summary (2-3 sentence plain-text summary for the recipient)\n- file_name (copy from input or Unknown)\n- patient_name (extract ONLY if explicitly stated in document, otherwise Unknown - DO NOT generate fake names)\n- patient_dob (extract ONLY if explicitly stated, otherwise null - DO NOT generate fake dates)\n- referring_doctor (extract ONLY if explicitly stated, otherwise null - DO NOT invent doctor names)\n- urgency_level (routine, urgent, or stat based on document content)\n- requires_action (boolean - true if action needed)\n- fax_metadata (copy from input or null)\n\nINPUT DATA:\nDocument Text: ${data.document_text}\nFile Name: ${data.file_name}\nDocument Type: ${data.selected_document_type}\nDefault Email: ${data.default_routing_email_address}\nFax Metadata: ${data.fax_metadata}\n\n###STORED_BINARY_START###\n${JSON.stringify(data.stored_binary)}\n###STORED_BINARY_END###`;\n\n// Build the Gemini API request\nconst requestBody = {\n  contents: [\n    {\n      role: \"user\",\n      parts: [\n        {\n          text: promptText\n        }\n      ]\n    }\n  ],\n  generationConfig: {\n    temperature: 0.2,\n    responseMimeType: \"application/json\"\n  }\n};\n\nreturn {\n  json: requestBody,\n  binary: $input.item.binary\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        -208
+      ],
+      "id": "d7ebae58-2f43-4d96-95cf-64d48c162e03",
+      "name": "Make it ready for Gemini"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        784,
+        0
+      ],
+      "id": "3590bf1e-24ca-4980-8c9b-8fefdaa09a3a",
+      "name": "HTTP Request",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "_INSERT_YOUR_CREDENTIAL_ID",
+          "name": "_INSERT_YOUR_GOOGLE_GEMINI_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $input.first().json;\nconst text = resp.candidates[0].content.parts[0].text;\nconst parsedJson = JSON.parse(text);\n\nconst allInputs = $input.all();\n\nconst debugInfo = {\n  inputsCount: allInputs.length,\n  input0Keys: allInputs[0] ? Object.keys(allInputs[0].json) : []\n};\n\n// The input to HTTP Request is what \"Make it ready for Gemini\" outputs\nlet storedBinary = null;\n\nif (allInputs.length > 0) {\n  const inputJson = allInputs[0].json;\n  \n  debugInfo.inputJsonKeys = Object.keys(inputJson);\n  \n  // Check if the input has the request body with contents\n  if (inputJson.contents && Array.isArray(inputJson.contents) && inputJson.contents[0]) {\n    debugInfo.hasContentsInInput = true;\n    \n    const parts = inputJson.contents[0].parts;\n    if (parts && Array.isArray(parts)) {\n      debugInfo.partsCount = parts.length;\n      \n      // Find the text part with our prompt\n      const textPart = parts.find(p => p && p.text);\n      \n      if (textPart && textPart.text) {\n        debugInfo.textPartLength = textPart.text.length;\n        debugInfo.hasMarkers = textPart.text.includes('###STORED_BINARY_START###');\n        \n        // Extract stored_binary\n        const match = textPart.text.match(/###STORED_BINARY_START###([\\s\\S]*?)###STORED_BINARY_END###/);\n        \n        if (match && match[1]) {\n          debugInfo.extractedLength = match[1].trim().length;\n          try {\n            storedBinary = JSON.parse(match[1].trim());\n            debugInfo.success = true;\n          } catch (e) {\n            debugInfo.parseError = e.message;\n            debugInfo.extractedPreview = match[1].substring(0, 200);\n          }\n        } else {\n          debugInfo.noMatch = true;\n        }\n      } else {\n        debugInfo.noTextPart = true;\n      }\n    }\n  } else {\n    debugInfo.noContentsInInput = true;\n  }\n}\n\nreturn [{\n  json: {\n    ...parsedJson,\n    stored_binary: storedBinary,\n    _debug: debugInfo\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1056,
+        0
+      ],
+      "id": "c3a44bcb-a753-4717-90ce-7ddf5c0c0a1b",
+      "name": "Parse Response"
+    },
+    {
+      "parameters": {
+        "sendTo": "kartaitesting@gmail.com",
+        "subject": "=={{ $json.email_subject }}",
+        "emailType": "text",
+        "message": "=={{ $json.email_body }}",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "file_1"
+              },
+              {
+                "property": "file_2"
+              },
+              {
+                "property": "file_3"
+              },
+              {
+                "property": "file_4"
+              },
+              {
+                "property": "file_5"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1328,
+        32
+      ],
+      "id": "e7d8c451-a831-40ee-9564-61a20c3dd233",
+      "name": "Send a message",
+      "webhookId": "_INSERT_YOUR_WEBHOOK_ID",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "_INSERT_YOUR_CREDENTIAL_ID",
+          "name": "_INSERT_YOUR_GMAIL_CREDENTIAL_NAME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const formData = $input.first().json;\nconst files = formData['Upload Document'] || [];\nconst binaryData = $input.first().binary || {};\n\nconst binaryKeys = Object.keys(binaryData).filter(key => key.startsWith('Upload_Document'));\n\nconsole.log(`Processing ${files.length} files`);\n\nconst items = files.map((file, index) => {\n  const binaryKey = binaryKeys[index] || binaryKeys[0];\n  const fileBinary = binaryData[binaryKey];\n  \n  return {\n    json: {\n      'Upload Document': [file],\n      'Document Type': formData['Document Type'],\n      'Additional Notes': formData['Additional Notes'],\n      'Primary Email ID': formData['Primary Email ID'],\n      batch_id: Date.now(),\n      file_number: index + 1,\n      total_files: files.length,\n      // Store binary as base64 in JSON\n      stored_binary: {\n        data: fileBinary.data,\n        mimeType: fileBinary.mimeType,\n        fileName: fileBinary.fileName\n      }\n    },\n    binary: {\n      'Upload_Document': fileBinary\n    }\n  };\n});\n\nreturn items;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        0
+      ],
+      "id": "25e14b89-922c-4b31-ad2a-44fd56ed0b18",
+      "name": "Split files for processing"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        832,
+        224
+      ],
+      "id": "d15db0c6-43f3-46a4-89ab-e9918f38ebbf",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The merge node combines data from both inputs\nconst items = $input.all();\n\nconsole.log(`Total merged items: ${items.length}`);\n\nconst results = [];\nconst allBinary = {};\n\nitems.forEach((item, index) => {\n  console.log(`Item ${index} keys:`, Object.keys(item.json));\n  \n  // Get classification result (from Parse Response / Input 1)\n  const classification = {\n    file_name: item.json.file_name,\n    patient_name: item.json.patient_name,\n    document_category: item.json.document_category,\n    urgency_level: item.json.urgency_level,\n    referring_doctor: item.json.referring_doctor,\n    suggested_email_summary: item.json.suggested_email_summary\n  };\n  \n  results.push(classification);\n  \n  // Get stored_binary (from Split Files / Input 2)\n  if (item.json.stored_binary) {\n    allBinary[`file_${index + 1}`] = {\n      data: item.json.stored_binary.data,\n      mimeType: item.json.stored_binary.mimeType,\n      fileName: item.json.stored_binary.fileName,\n      fileExtension: item.json.stored_binary.fileName.split('.').pop()\n    };\n    console.log(`Added binary ${index + 1}: ${item.json.stored_binary.fileName}`);\n  } else {\n    console.log(`No stored_binary in item ${index}`);\n  }\n});\n\n// CRITICAL: Pad to exactly 5 files with empty placeholders\nconst MAX_FILES = 5;\nfor (let i = 1; i <= MAX_FILES; i++) {\n  const key = `file_${i}`;\n  if (!allBinary[key]) {\n    // Create minimal empty PDF as placeholder (107 bytes)\n    allBinary[key] = {\n      data: 'JVBERi0xLjAKJcfsj6IKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9LaWRzIFtdCi9Db3VudCAwCj4+CmVuZG9iagp4cmVmCjAgMwowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAp0cmFpbGVyCjw8Ci9TaXplIDMKL1Jvb3QgMSAwIFIKPj4Kc3RhcnR4cmVmCjEwNwolJUVPRgo=',\n      mimeType: 'application/pdf',\n      fileName: `placeholder_${i}.pdf`,\n      fileExtension: 'pdf'\n    };\n    console.log(`Created placeholder for file_${i}`);\n  }\n}\n\n// Build email summary\nlet summaryText = `\ud83d\udccb BATCH PROCESSING SUMMARY\\n`;\nsummaryText += `Total Documents: ${results.length}\\n`;\nsummaryText += `Date: ${new Date().toLocaleString()}\\n\\n`;\nsummaryText += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\\n\\n`;\n\nresults.forEach((result, index) => {\n  summaryText += `\ud83d\udcc4 DOCUMENT ${index + 1}: ${result.file_name || 'Unknown'}\\n`;\n  summaryText += `   Patient: ${result.patient_name || 'Unknown'}\\n`;\n  summaryText += `   Category: ${result.document_category || 'Unknown'}\\n`;\n  summaryText += `   Urgency: ${(result.urgency_level || 'routine').toUpperCase()}\\n`;\n  summaryText += `   Referring Doctor: ${result.referring_doctor || 'Unknown'}\\n`;\n  summaryText += `   Summary: ${result.suggested_email_summary || ''}\\n\\n`;\n  summaryText += `${'\u2500'.repeat(50)}\\n\\n`;\n});\n\nconst urgentCount = results.filter(r => r.urgency_level === 'urgent' || r.urgency_level === 'stat').length;\nconst emailSubject = urgentCount > 0 \n  ? `\u26a0\ufe0f BATCH: ${results.length} Documents (${urgentCount} URGENT)` \n  : `\ud83d\udce8 BATCH: ${results.length} Documents Processed`;\n\nconsole.log(`Created ${Object.keys(allBinary).length} binary attachments (including placeholders)`);\n\nreturn [{\n  json: {\n    email_subject: emailSubject,\n    email_body: summaryText,\n    total_files: results.length,\n    debug_binary_keys: Object.keys(allBinary)\n  },\n  binary: allBinary\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        224
+      ],
+      "id": "1d8a2d22-b913-489f-b67b-e8a16d058ecd",
+      "name": "Build email with attachments"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Split files for processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpret the file": {
+      "main": [
+        [
+          {
+            "node": "Make it ready for Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make it ready for Gemini": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Parse Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Response": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split files for processing": {
+      "main": [
+        [
+          {
+            "node": "Interpret the file",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Build email with attachments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build email with attachments": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "_INSERT_YOUR_VERSION_ID",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "_INSERT_YOUR_INSTANCE_ID"
+  },
+  "id": "_INSERT_YOUR_WORKFLOW_ID",
+  "tags": [
+    {
+      "createdAt": "_INSERT_TIMESTAMP",
+      "updatedAt": "_INSERT_TIMESTAMP",
+      "id": "_INSERT_YOUR_TAG_ID",
+      "name": "Healthcare Document"
+    }
+  ]
+}
